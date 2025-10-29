@@ -76,7 +76,7 @@ public abstract class MEMachineComponent extends TileColorableMachineComponent i
 
     @Override
     public void gridChanged() {
-
+        // Delegate to subclasses - MEItemBus overrides this
     }
 
     @Nonnull
