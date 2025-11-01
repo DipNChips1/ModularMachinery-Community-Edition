@@ -8,6 +8,7 @@ import appeng.api.storage.data.IAEItemStack;
 import appeng.me.GridAccessException;
 import appeng.util.Platform;
 import github.kasuminova.mmce.common.tile.base.MEItemBus;
+import github.kasuminova.mmce.common.util.MEBusProfiler;
 import hellfirepvp.modularmachinery.ModularMachinery;
 import hellfirepvp.modularmachinery.common.lib.ItemsMM;
 import hellfirepvp.modularmachinery.common.machine.IOType;
@@ -71,6 +72,23 @@ public class MEItemInputBus extends MEItemBus implements SettingsTransfer {
         return inv;
     }
 
+    // ============================================================
+// ENHANCED PROFILING SUPPORT - Report as INPUT bus
+// ============================================================
+    @Override
+    protected void reportProfilingData(long tickTimeNanos, long processWorkTimeNanos, long getSlotsTimeNanos) {
+        MEBusProfiler.getInstance().recordInputBusTick(tickTimeNanos, processWorkTimeNanos, getSlotsTimeNanos);
+    }
+
+    @Override
+    protected void reportEnhancedMetrics(int slotsChecked, int ae2OpsCount, int successfulOps, long itemsTransferred) {
+        // This method is not used in Base MMCE implementation
+        // Enhanced metrics are reported directly in tickingRequest()
+    }
+// ============================================================
+// END PROFILING SUPPORT
+// ============================================================
+
     @Override
     public void readCustomNBT(final NBTTagCompound compound) {
         super.readCustomNBT(compound);
@@ -105,26 +123,14 @@ public class MEItemInputBus extends MEItemBus implements SettingsTransfer {
     @Nonnull
     @Override
     public TickingRequest getTickingRequest(@Nonnull final IGridNode node) {
-        return new TickingRequest(10, 120, !needsUpdate(), true);
+        return new TickingRequest(5, 60, !hasItem(), true);
     }
 
-    private boolean needsUpdate() {
-        for (int slot = 0; slot < configInventory.getSlots(); slot++) {
-            ItemStack cfgStack = configInventory.getStackInSlot(slot);
-            ItemStack invStack = inventory.getStackInSlot(slot);
-
-            if (cfgStack.isEmpty()) {
-                if (!invStack.isEmpty()) {
-                    return true;
-                }
-                continue;
-            }
-
-            if (invStack.isEmpty()) {
-                return true;
-            }
-
-            if (!ItemUtils.matchStacks(cfgStack, invStack) || invStack.getCount() != cfgStack.getCount()) {
+    @Override
+    public boolean hasItem() {
+        for (int i = 0; i < inventory.getSlots(); i++) {
+            ItemStack stack = inventory.getStackInSlot(i);
+            if (!stack.isEmpty()) {
                 return true;
             }
         }
@@ -134,12 +140,42 @@ public class MEItemInputBus extends MEItemBus implements SettingsTransfer {
     @Nonnull
     @Override
     public TickRateModulation tickingRequest(@Nonnull final IGridNode node, final int ticksSinceLastCall) {
+        // ============================================================
+        // ENHANCED PROFILING: Start timing and metrics
+        // ============================================================
+        long tickStartTime = MEBusProfiler.isProfilingEnabled() ? System.nanoTime() : 0;
+        long[] profilingData = startProfiling();
+        long processWorkTime = 0;
+
+        // Enhanced metrics tracking
+        int slotsChecked = 0;
+        int ae2Operations = 0;
+        int successfulOperations = 0;
+        long itemsTransferred = 0;
+        // ============================================================
+
         if (!proxy.isActive()) {
+            endProfiling(profilingData, tickStartTime);
+            if (MEBusProfiler.isProfilingEnabled()) {
+                MEBusProfiler.getInstance().recordInputBusEnhancedMetrics(slotsChecked, ae2Operations, successfulOperations, itemsTransferred);
+            }
             return TickRateModulation.IDLE;
         }
 
+        // ============================================================
+        // PROFILING: Time getNeedUpdateSlots()
+        // ============================================================
+        long getSlotsStart = MEBusProfiler.isProfilingEnabled() ? System.nanoTime() : 0;
         int[] needUpdateSlots = getNeedUpdateSlots();
+        recordGetSlotsTime(profilingData, getSlotsStart);
+        slotsChecked = needUpdateSlots.length;
+        // ============================================================
+
         if (needUpdateSlots.length == 0) {
+            endProfiling(profilingData, tickStartTime);
+            if (MEBusProfiler.isProfilingEnabled()) {
+                MEBusProfiler.getInstance().recordInputBusEnhancedMetrics(slotsChecked, ae2Operations, successfulOperations, itemsTransferred);
+            }
             return TickRateModulation.SLOWER;
         }
 
@@ -150,7 +186,17 @@ public class MEItemInputBus extends MEItemBus implements SettingsTransfer {
 
             boolean successAtLeastOnce = false;
             inTick = true;
+
+            // ============================================================
+            // PROFILING: Time work processing
+            // ============================================================
+            long processWorkStart = MEBusProfiler.isProfilingEnabled() ? System.nanoTime() : 0;
+            // ============================================================
+
+            // AE2 Operation #1: Get ME inventory
             IMEMonitor<IAEItemStack> inv = proxy.getStorage().getInventory(channel);
+            ae2Operations++;
+
             for (final int slot : needUpdateSlots) {
                 changedSlots[slot] = false;
                 ItemStack cfgStack = configInventory.getStackInSlot(slot);
@@ -160,16 +206,46 @@ public class MEItemInputBus extends MEItemBus implements SettingsTransfer {
                     if (invStack.isEmpty()) {
                         continue;
                     }
-                    inventory.setStackInSlot(slot, insertStackToAE(inv, invStack));
+                    // Export operation
+                    int itemsBefore = invStack.getCount();
+                    ItemStack result = insertStackToAE(inv, invStack);
+                    ae2Operations += 2; // createStack + poweredInsert
+
+                    inventory.setStackInSlot(slot, result);
+                    if (result.getCount() < itemsBefore) {
+                        successfulOperations++;
+                        itemsTransferred += (itemsBefore - result.getCount());
+                    }
                     continue;
                 }
 
                 if (!ItemUtils.matchStacks(cfgStack, invStack)) {
-                    if (invStack.isEmpty() || insertStackToAE(inv, invStack).isEmpty()) {
+                    if (invStack.isEmpty()) {
+                        // Import operation
                         ItemStack stack = extractStackFromAE(inv, cfgStack);
+                        ae2Operations += 2; // createStack + poweredExtraction
+
                         inventory.setStackInSlot(slot, stack);
                         if (!stack.isEmpty()) {
                             successAtLeastOnce = true;
+                            successfulOperations++;
+                            itemsTransferred += stack.getCount();
+                        }
+                    } else {
+                        // Export then import
+                        ItemStack exportResult = insertStackToAE(inv, invStack);
+                        ae2Operations += 2; // createStack + poweredInsert
+
+                        if (exportResult.isEmpty()) {
+                            ItemStack stack = extractStackFromAE(inv, cfgStack);
+                            ae2Operations += 2; // createStack + poweredExtraction
+
+                            inventory.setStackInSlot(slot, stack);
+                            if (!stack.isEmpty()) {
+                                successAtLeastOnce = true;
+                                successfulOperations++;
+                                itemsTransferred += (invStack.getCount() + stack.getCount());
+                            }
                         }
                     }
                     continue;
@@ -180,40 +256,74 @@ public class MEItemInputBus extends MEItemBus implements SettingsTransfer {
                 }
 
                 if (cfgStack.getCount() > invStack.getCount()) {
+                    // Import more items
                     int countToReceive = cfgStack.getCount() - invStack.getCount();
                     ItemStack stack = extractStackFromAE(inv, ItemUtils.copyStackWithSize(invStack, countToReceive));
+                    ae2Operations += 2; // createStack + poweredExtraction
+
                     if (!stack.isEmpty()) {
                         int newCount = invStack.getCount() + stack.getCount();
                         inventory.setStackInSlot(slot, ItemUtils.copyStackWithSize(invStack, newCount));
                         successAtLeastOnce = true;
+                        successfulOperations++;
+                        itemsTransferred += stack.getCount();
                         failureCounter[slot] = 0;
                     } else {
                         // If AE doesn't have enough item?
                         failureCounter[slot]++;
                     }
                 } else {
+                    // Export excess items
                     int countToExtract = invStack.getCount() - cfgStack.getCount();
+                    int itemsBefore = countToExtract;
                     ItemStack stack = insertStackToAE(inv, ItemUtils.copyStackWithSize(invStack, countToExtract));
+                    ae2Operations += 2; // createStack + poweredInsert
+
                     if (stack.isEmpty()) {
                         inventory.setStackInSlot(slot, ItemUtils.copyStackWithSize(
-                            invStack, invStack.getCount() - countToExtract)
+                                invStack, invStack.getCount() - countToExtract)
                         );
+                        successfulOperations++;
+                        itemsTransferred += itemsBefore;
                     } else {
                         inventory.setStackInSlot(slot, ItemUtils.copyStackWithSize(
-                            invStack, invStack.getCount() - countToExtract + stack.getCount())
+                                invStack, invStack.getCount() - countToExtract + stack.getCount())
                         );
+                        if (stack.getCount() < itemsBefore) {
+                            successfulOperations++;
+                            itemsTransferred += (itemsBefore - stack.getCount());
+                        }
                     }
                     successAtLeastOnce = true;
                 }
             }
 
+            // ============================================================
+            // PROFILING: Record work processing time
+            // ============================================================
+            if (MEBusProfiler.isProfilingEnabled()) {
+                processWorkTime = System.nanoTime() - processWorkStart;
+                recordProcessWorkTime(profilingData, processWorkTime);
+            }
+            // ============================================================
+
             inTick = false;
             rwLock.writeLock().unlock();
+
+            endProfiling(profilingData, tickStartTime);
+            if (MEBusProfiler.isProfilingEnabled()) {
+                MEBusProfiler.getInstance().recordInputBusEnhancedMetrics(slotsChecked, ae2Operations, successfulOperations, itemsTransferred);
+            }
             return successAtLeastOnce ? TickRateModulation.FASTER : TickRateModulation.SLOWER;
         } catch (GridAccessException e) {
             inTick = false;
             changedSlots = new boolean[changedSlots.length];
             rwLock.writeLock().unlock();
+
+            endProfiling(profilingData, tickStartTime);
+            if (MEBusProfiler.isProfilingEnabled()) {
+                MEBusProfiler.getInstance().recordInputBusEnhancedMetrics(slotsChecked, ae2Operations, successfulOperations, itemsTransferred);
+            }
             return TickRateModulation.IDLE;
         }
     }

@@ -8,6 +8,7 @@ import appeng.api.storage.data.IAEItemStack;
 import appeng.me.GridAccessException;
 import appeng.util.Platform;
 import github.kasuminova.mmce.common.tile.base.MEItemBus;
+import github.kasuminova.mmce.common.util.MEBusProfiler;
 import hellfirepvp.modularmachinery.common.lib.ItemsMM;
 import hellfirepvp.modularmachinery.common.machine.IOType;
 import hellfirepvp.modularmachinery.common.machine.MachineComponent;
@@ -43,6 +44,23 @@ public class MEItemOutputBus extends MEItemBus {
         return new ItemStack(ItemsMM.meItemOutputBus);
     }
 
+    // ============================================================
+// PROFILING SUPPORT - Report as OUTPUT bus
+// ============================================================
+    @Override
+    protected void reportProfilingData(long tickTimeNanos, long processWorkTimeNanos, long getSlotsTimeNanos) {
+        MEBusProfiler.getInstance().recordOutputBusTick(tickTimeNanos, processWorkTimeNanos, getSlotsTimeNanos);
+    }
+
+    @Override
+    protected void reportEnhancedMetrics(int slotsChecked, int ae2OpsCount, int successfulOps, long itemsTransferred) {
+        // This method is not used in Base MMCE implementation
+        // Enhanced metrics are reported directly in tickingRequest()
+    }
+// ============================================================
+// END PROFILING SUPPORT
+// ============================================================
+
     @Nullable
     @Override
     public MachineComponent.ItemBus provideComponent() {
@@ -63,12 +81,42 @@ public class MEItemOutputBus extends MEItemBus {
     @Nonnull
     @Override
     public TickRateModulation tickingRequest(@Nonnull final IGridNode node, final int ticksSinceLastCall) {
+        // ============================================================
+        // ENHANCED PROFILING: Start timing and metrics
+        // ============================================================
+        long tickStartTime = MEBusProfiler.isProfilingEnabled() ? System.nanoTime() : 0;
+        long[] profilingData = startProfiling();
+        long processWorkTime = 0;
+
+        // Enhanced metrics tracking
+        int slotsChecked = 0;
+        int ae2Operations = 0;
+        int successfulOperations = 0;
+        long itemsTransferred = 0;
+        // ============================================================
+
         if (!proxy.isActive()) {
+            endProfiling(profilingData, tickStartTime);
+            if (MEBusProfiler.isProfilingEnabled()) {
+                MEBusProfiler.getInstance().recordOutputBusEnhancedMetrics(slotsChecked, ae2Operations, successfulOperations, itemsTransferred);
+            }
             return TickRateModulation.IDLE;
         }
 
+        // ============================================================
+        // PROFILING: Time getNeedUpdateSlots()
+        // ============================================================
+        long getSlotsStart = MEBusProfiler.isProfilingEnabled() ? System.nanoTime() : 0;
         int[] needUpdateSlots = getNeedUpdateSlots();
+        recordGetSlotsTime(profilingData, getSlotsStart);
+        slotsChecked = needUpdateSlots.length;
+        // ============================================================
+
         if (needUpdateSlots.length == 0) {
+            endProfiling(profilingData, tickStartTime);
+            if (MEBusProfiler.isProfilingEnabled()) {
+                MEBusProfiler.getInstance().recordOutputBusEnhancedMetrics(slotsChecked, ae2Operations, successfulOperations, itemsTransferred);
+            }
             return TickRateModulation.SLOWER;
         }
 
@@ -80,7 +128,16 @@ public class MEItemOutputBus extends MEItemBus {
         try {
             rwLock.writeLock().lock();
 
+            // ============================================================
+            // PROFILING: Time work processing
+            // ============================================================
+            long processWorkStart = MEBusProfiler.isProfilingEnabled() ? System.nanoTime() : 0;
+            // ============================================================
+
+            // AE2 Operation #1: Get ME inventory
             IMEMonitor<IAEItemStack> inv = proxy.getStorage().getInventory(channel);
+            ae2Operations++;
+
             for (final int slot : needUpdateSlots) {
                 changedSlots[slot] = false;
                 ItemStack stack = inventory.getStackInSlot(slot);
@@ -90,31 +147,59 @@ public class MEItemOutputBus extends MEItemBus {
 
                 ItemStack extracted = inventory.extractItem(slot, stack.getCount(), false);
 
+                // AE2 Operation #2: Create AE stack
                 IAEItemStack aeStack = channel.createStack(extracted);
+                ae2Operations++;
+
                 if (aeStack == null) {
                     continue;
                 }
 
+                // AE2 Operation #3: Powered insert to ME network
                 IAEItemStack left = Platform.poweredInsert(proxy.getEnergy(), inv, aeStack, source);
+                ae2Operations++;
 
                 if (left != null) {
                     inventory.setStackInSlot(slot, left.createItemStack());
 
                     if (aeStack.getStackSize() != left.getStackSize()) {
                         successAtLeastOnce = true;
+                        successfulOperations++;
+                        itemsTransferred += (aeStack.getStackSize() - left.getStackSize());
                     }
                 } else {
                     successAtLeastOnce = true;
+                    successfulOperations++;
+                    itemsTransferred += aeStack.getStackSize();
                 }
             }
 
+            // ============================================================
+            // PROFILING: Record work processing time
+            // ============================================================
+            if (MEBusProfiler.isProfilingEnabled()) {
+                processWorkTime = System.nanoTime() - processWorkStart;
+                recordProcessWorkTime(profilingData, processWorkTime);
+            }
+            // ============================================================
+
             inTick = false;
             rwLock.writeLock().unlock();
+
+            endProfiling(profilingData, tickStartTime);
+            if (MEBusProfiler.isProfilingEnabled()) {
+                MEBusProfiler.getInstance().recordOutputBusEnhancedMetrics(slotsChecked, ae2Operations, successfulOperations, itemsTransferred);
+            }
             return successAtLeastOnce ? TickRateModulation.FASTER : TickRateModulation.SLOWER;
         } catch (GridAccessException e) {
             inTick = false;
             changedSlots = new boolean[changedSlots.length];
             rwLock.writeLock().unlock();
+
+            endProfiling(profilingData, tickStartTime);
+            if (MEBusProfiler.isProfilingEnabled()) {
+                MEBusProfiler.getInstance().recordOutputBusEnhancedMetrics(slotsChecked, ae2Operations, successfulOperations, itemsTransferred);
+            }
             return TickRateModulation.IDLE;
         }
     }

@@ -3,6 +3,7 @@ package github.kasuminova.mmce.common.tile.base;
 import appeng.api.AEApi;
 import appeng.api.networking.ticking.IGridTickable;
 import appeng.api.storage.channels.IItemStorageChannel;
+import github.kasuminova.mmce.common.util.MEBusProfiler;
 import hellfirepvp.modularmachinery.common.util.IOInventory;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -18,6 +19,18 @@ import javax.annotation.Nullable;
 import java.util.stream.IntStream;
 
 public abstract class MEItemBus extends MEMachineComponent implements IGridTickable {
+
+    static {
+        if (MEBusProfiler.isProfilingEnabled()) {
+            System.out.println("========================================");
+            System.out.println("MEItemBus static initializer: Forcing profiler initialization...");
+            System.out.println("========================================");
+            MEBusProfiler.getInstance();
+            System.out.println("========================================");
+            System.out.println("MEItemBus static initializer: Profiler initialized!");
+            System.out.println("========================================");
+        }
+    }
 
     protected final IItemStorageChannel channel = AEApi.instance().storage().getStorageChannel(IItemStorageChannel.class);
 
@@ -47,6 +60,63 @@ public abstract class MEItemBus extends MEMachineComponent implements IGridTicka
         }
         return needUpdateSlots.toIntArray();
     }
+
+    // ============================================================
+    // PROFILING SUPPORT - Subclasses must implement this
+    // ============================================================
+    /**
+     * Override in subclasses to report to correct bus type in profiler.
+     * This is the ONLY change from base MMCE for profiling support.
+     */
+    protected abstract void reportProfilingData(long tickTimeNanos, long processWorkTimeNanos, long getSlotsTimeNanos);
+
+    /**
+     * Override in subclasses to report enhanced metrics to profiler.
+     * This includes AE2 operation counts, success rates, and items transferred.
+     */
+    protected abstract void reportEnhancedMetrics(int slotsChecked, int ae2OpsCount, int successfulOps, long itemsTransferred);
+
+    /**
+     * Helper method for subclasses to wrap their tickingRequest with profiling.
+     * Call this at the start of tickingRequest, and call endProfiling() in finally block.
+     */
+    protected long[] startProfiling() {
+        if (!MEBusProfiler.isProfilingEnabled()) {
+            return null;
+        }
+        return new long[3]; // [tickStart, processWorkStart, getSlotsTime]
+    }
+
+    /**
+     * Call this after getNeedUpdateSlots() to track that timing.
+     */
+    protected void recordGetSlotsTime(long[] profilingData, long getSlotsStart) {
+        if (profilingData != null) {
+            profilingData[2] = System.nanoTime() - getSlotsStart;
+        }
+    }
+
+    /**
+     * Call this after processing work to track that timing.
+     */
+    protected void recordProcessWorkTime(long[] profilingData, long processWorkTime) {
+        if (profilingData != null) {
+            profilingData[1] = processWorkTime;
+        }
+    }
+
+    /**
+     * Call this in finally block to complete profiling.
+     */
+    protected void endProfiling(long[] profilingData, long tickStartTime) {
+        if (profilingData == null) return;
+
+        long tickDuration = System.nanoTime() - tickStartTime;
+        reportProfilingData(tickDuration, profilingData[1], profilingData[2]);
+    }
+    // ============================================================
+    // END PROFILING SUPPORT
+    // ============================================================
 
     public IOInventory getInternalInventory() {
         return inventory;
